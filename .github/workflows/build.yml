@@ -1,0 +1,123 @@
+name: Build gateway with shared APP
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  resolve-app:
+    runs-on: ubuntu-24.04
+    outputs:
+      sha: ${{ steps.app-commit.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: SecureTunnelRG
+          persist-credentials: false
+      - name: Read shared APP reference
+        id: app-ref
+        working-directory: SecureTunnelRG
+        shell: bash
+        run: |
+          set -euo pipefail
+          ref="$(cat build/securetunnel-app.ref)"
+          if [[ ! "$ref" =~ ^[a-zA-Z0-9][a-zA-Z0-9._/-]*$ ]]; then
+            echo "::error::Invalid APP reference in build/securetunnel-app.ref"
+            exit 1
+          fi
+          if [[ "$GITHUB_REF" == refs/tags/* && ! "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+            echo "::error::Tag builds require a full APP commit SHA in build/securetunnel-app.ref"
+            exit 1
+          fi
+          echo "ref=$ref" >> "$GITHUB_OUTPUT"
+      - name: Checkout shared APP to resolve its commit
+        uses: actions/checkout@v7
+        with:
+          repository: vvhh2002/SecureTunnelAPP
+          ref: ${{ steps.app-ref.outputs.ref }}
+          path: SecureTunnelAPP
+          token: ${{ secrets.SECURETUNNEL_APP_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Resolve one APP commit for all architectures
+        id: app-commit
+        working-directory: SecureTunnelAPP
+        run: echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+
+  build:
+    needs: resolve-app
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            arch: amd64
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            arch: arm64
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    env:
+      CARGO_TERM_COLOR: always
+      BUILD_TARGET: ${{ matrix.target }}
+      CARGO_TARGET_X86_64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+      CARGO_TARGET_AARCH64_UNKNOWN_LINUX_MUSL_LINKER: musl-gcc
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          path: SecureTunnelRG
+          persist-credentials: false
+      - name: Checkout the resolved shared APP source
+        uses: actions/checkout@v7
+        with:
+          repository: vvhh2002/SecureTunnelAPP
+          ref: ${{ needs.resolve-app.outputs.sha }}
+          path: SecureTunnelAPP
+          token: ${{ secrets.SECURETUNNEL_APP_TOKEN || github.token }}
+          persist-credentials: false
+      - name: Prepare Rust
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install --yes musl-tools binutils
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+          rustup target add "$BUILD_TARGET"
+      - name: Check APP library and RG binary
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo fmt --manifest-path SecureTunnelAPP/Cargo.toml -- --check
+          cargo clippy --manifest-path SecureTunnelAPP/Cargo.toml --package securetunnel-app --lib --bin securetunnel-rg --locked --target "$BUILD_TARGET" -- -D warnings
+      - name: Build static musl RG binary from APP
+        run: bash SecureTunnelRG/build/build.sh --target "$BUILD_TARGET"
+      - name: Build and smoke-test the Debian slim scaffold container
+        working-directory: SecureTunnelRG
+        env:
+          IMAGE_ARCH: ${{ matrix.arch }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          image="securetunnel-rg:scaffold-${IMAGE_ARCH}"
+          docker build --pull --platform "linux/${IMAGE_ARCH}" -f packaging/docker/Dockerfile -t "$image" "dist/${BUILD_TARGET}/stage"
+          docker run --rm --entrypoint /bin/sh "$image" -ec '. /etc/os-release; test "$ID" = debian; test "$VERSION_CODENAME" = trixie'
+          docker run --rm "$image" --version
+          docker run --rm "$image" --help
+          docker save "$image" | gzip > "dist/securetunnel-rg-linux-${IMAGE_ARCH}-docker.tar.gz"
+      - name: Upload scaffold artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: securetunnel-rg-linux-${{ matrix.arch }}-scaffold
+          path: SecureTunnelRG/dist/*.tar.gz
+          if-no-files-found: error
+          retention-days: 14

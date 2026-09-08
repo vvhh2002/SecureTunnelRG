@@ -1,0 +1,52 @@
+# 设计草案：当前程序不会读取或应用此文件；部署前必须校验并替换示例值。
+schema_version = 0
+role = "connector"
+node_name = "rg-example"
+ipv4_only = true
+
+[management]
+listen = "127.0.0.1:8080"
+helper_socket = "/run/securetunnel/helper.sock"
+
+[ssh_client]
+# 主动出站连接 LG；重连时重新解析 DDNS，始终固定校验主机密钥。
+host = "hub.example.com"
+port = 22
+user = "securetunnel-d-data"
+identity_file = "/etc/securetunnel/keys/d_data_ed25519"
+known_hosts_file = "/etc/securetunnel/known_hosts"
+strict_host_key_checking = true
+batch_mode = true
+exit_on_forward_failure = true
+server_alive_interval_seconds = 15
+server_alive_count_max = 3
+remote_tun_id = 41
+
+[tunnel]
+name = "tun41"
+local_address = "10.254.41.2/30"
+peer_address = "10.254.41.1"
+mtu = 1400
+
+[remote_lan]
+# 按部署设备实际接口和地址替换。
+interface = "eth1"
+address = "10.60.8.23"
+
+[[routes]]
+destination = "192.168.50.37/32"
+via = "10.254.41.1"
+interface = "tun41"
+
+[forwarding]
+default_policy = "drop"
+snat_address = "10.60.8.23"
+snat_interface = "eth1"
+
+# 最终目标白名单必须由 RG 独立执行；不能仅信任 LG 的过滤。
+[[forwarding.allow]]
+source = "192.168.50.37/32"
+destination = "10.60.20.45/32"
+tcp_ports = [8080]
+udp_ports = []
+icmp_echo = true

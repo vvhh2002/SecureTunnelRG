@@ -1,0 +1,6 @@
+/target/
+/dist/
+.DS_Store
+.env
+/config/local*.toml
+/config/keys/
